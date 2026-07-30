@@ -31,5 +31,8 @@
         <key name="block-unsafe-extractor" type="b">
             <default>true</default>
         </key>
+        <key name="installed-apps-view-mode" type="s">
+            <default>"list"</default>
+        </key>
     </schema>
 </schemalist>

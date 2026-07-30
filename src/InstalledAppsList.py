@@ -10,9 +10,10 @@ from .models.AppListElement import InstalledStatus
 from .components.FilterEntry import FilterEntry
 from .components.CustomComponents import NoAppsFoundRow
 from .components.AppListBoxItem import AppListBoxItem
+from .components.AppGridBoxItem import AppGridBoxItem
 from .preferences import Preferences
 from .WelcomeScreen import WelcomeScreen
-from .lib.utils import get_application_window, check_internet
+from .lib.utils import get_application_window, check_internet, show_message_dialog, show_remove_confirm_dialog
 from .lib.async_utils import _async, idle
 from .models.UpdateManagerChecker import UpdateManagerChecker
 from .models.Settings import Settings
@@ -47,7 +48,23 @@ class InstalledAppsList(Gtk.ScrolledWindow):
 
         self.installed_apps_list_slot.append(self.installed_apps_list)
 
+        self.installed_apps_grid = Gtk.FlowBox(
+            valign=Gtk.Align.START,
+            selection_mode=Gtk.SelectionMode.NONE,
+            homogeneous=True,
+            column_spacing=6,
+            row_spacing=6,
+            min_children_per_line=2,
+            max_children_per_line=30,
+        )
+        self.installed_apps_grid.connect('child-activated', self.on_activated_grid_child)
+
+        self.view_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.view_stack.add_named(self.installed_apps_list_slot, 'list')
+        self.view_stack.add_named(self.installed_apps_grid, 'grid')
+
         self.installed_apps_list_rows: List[AppListBoxItem] = []
+        self.installed_apps_grid_rows: List[AppGridBoxItem] = []
         self.no_apps_found_row = NoAppsFoundRow(visible=False)
 
         # Create the filter search bar
@@ -76,12 +93,37 @@ class InstalledAppsList(Gtk.ScrolledWindow):
             css_classes=['suggested-action']
         )
 
+        # list/grid view switcher
+        saved_view_mode = Settings.settings.get_string('installed-apps-view-mode')
+
+        self.view_list_btn = Gtk.ToggleButton(
+            icon_name='view-list-symbolic',
+            tooltip_text=_('List view'),
+            active=(saved_view_mode != 'grid'),
+        )
+        self.view_grid_btn = Gtk.ToggleButton(
+            icon_name='view-grid-symbolic',
+            tooltip_text=_('Grid view'),
+            group=self.view_list_btn,
+            active=(saved_view_mode == 'grid'),
+        )
+
+        self.view_list_btn.connect('toggled', self.on_view_mode_toggled)
+        self.view_grid_btn.connect('toggled', self.on_view_mode_toggled)
+
+        view_mode_switcher = Gtk.Box(css_classes=['linked'])
+        view_mode_switcher.append(self.view_list_btn)
+        view_mode_switcher.append(self.view_grid_btn)
+
+        self.view_stack.set_visible_child_name('grid' if saved_view_mode == 'grid' else 'list')
+
         self.updates_btn.connect('clicked', self.on_fetch_updates_btn_clicked)
         self.update_all_btn.connect('clicked', self.on_update_all_btn_clicked)
+        title_row.append(view_mode_switcher)
         title_row.append(self.updates_btn)
         title_row.append(self.update_all_btn)
 
-        [self.main_box.append(el) for el in [title_row, self.installed_apps_list_slot]]
+        [self.main_box.append(el) for el in [title_row, self.view_stack, self.no_apps_found_row]]
 
         clamp = Adw.Clamp(child=self.main_box, maximum_size=clamp_size, margin_top=20, margin_bottom=20)
 
@@ -105,6 +147,18 @@ class InstalledAppsList(Gtk.ScrolledWindow):
         self.filter_entry.set_search_mode(False)
         self.emit('selected-app', row._app)
 
+    def on_activated_grid_child(self, flowbox, child: Gtk.FlowBoxChild):
+        self.filter_entry.set_search_mode(False)
+        self.emit('selected-app', child._app)
+
+    def on_view_mode_toggled(self, btn: Gtk.ToggleButton):
+        if not btn.get_active():
+            return
+
+        mode = 'grid' if btn is self.view_grid_btn else 'list'
+        self.view_stack.set_visible_child_name(mode)
+        Settings.settings.set_string('installed-apps-view-mode', mode)
+
     def trigger_search_mode(self):
         self.filter_entry.set_search_mode(
             not self.filter_entry.get_search_mode()
@@ -112,29 +166,41 @@ class InstalledAppsList(Gtk.ScrolledWindow):
 
     def refresh_list(self):
         self.installed_apps_list.remove_all()
+        self.installed_apps_grid.remove_all()
         self.updates_btn.set_label(self.CHECK_FOR_UPDATES_LABEL)
         self.installed_apps_list_rows = []
+        self.installed_apps_grid_rows = []
 
         installed: List[AppImageListElement] = appimage_provider.list_installed()
 
         for i in installed:
             list_row = AppListBoxItem(i, activatable=True, selectable=False, hexpand=True)
             list_row.set_update_version(i.version, i.size)
-
             list_row.load_icon()
             self.installed_apps_list_rows.append(list_row)
             self.installed_apps_list.append(list_row)
+
+            grid_row = AppGridBoxItem(i)
+            grid_row.set_update_version(i.version)
+            grid_row.load_icon()
+            grid_row.connect('launch-app', self.on_grid_item_launch)
+            grid_row.connect('update-app', self.on_grid_item_update)
+            grid_row.connect('remove-app', self.on_grid_item_remove)
+            self.installed_apps_grid_rows.append(grid_row)
+            self.installed_apps_grid.append(grid_row)
 
         if installed:
             self.container_stack.set_visible_child(self.clamp_container)
         else:
             self.container_stack.set_visible_child(self.placeholder)
 
-        self.installed_apps_list.append(self.no_apps_found_row)
         self.no_apps_found_row.set_visible(False)
-        
+
         self.installed_apps_list.set_sort_func(lambda r1, r2: self.sort_installed_apps_list(r1, r2))
         self.installed_apps_list.invalidate_sort()
+
+        self.installed_apps_grid.set_sort_func(lambda r1, r2: self.sort_installed_apps_list(r1, r2))
+        self.installed_apps_grid.invalidate_sort()
 
         self.update_all_btn.set_visible(False)
 
@@ -207,7 +273,7 @@ class InstalledAppsList(Gtk.ScrolledWindow):
 
     @idle
     def complete_updates_fetch(self, updatable_filepaths: list[str], updatable_apps: int, updates_available: int):
-        for row in self.installed_apps_list_rows:
+        for row in [*self.installed_apps_list_rows, *self.installed_apps_grid_rows]:
             if row._app.file_path in updatable_filepaths:
                 row.show_updatable_badge()
 
@@ -231,7 +297,7 @@ class InstalledAppsList(Gtk.ScrolledWindow):
         self.filter_query = widget.get_text()
         # self.installed_apps_list.invalidate_filter()
 
-        for row in self.installed_apps_list_rows:
+        for row in [*self.installed_apps_list_rows, *self.installed_apps_grid_rows]:
             if not getattr(row, 'force_show', False) and row._app.installed_status != InstalledStatus.INSTALLED:
                 row.set_visible(False)
                 continue
@@ -269,3 +335,32 @@ class InstalledAppsList(Gtk.ScrolledWindow):
     def on_open_welcome_screen(self, widget):
         tutorial = WelcomeScreen()
         tutorial.present(self)
+
+    def on_grid_item_launch(self, card, app: AppImageListElement):
+        appimage_provider.run(app)
+
+    @_async
+    def on_grid_item_update(self, card, app: AppImageListElement):
+        if appimage_provider.is_app_running(app):
+            GLib.idle_add(show_message_dialog, _('{app_name} is running, please close it before proceeding with the update').format(app_name=app.name))
+            return
+
+        manager = UpdateManagerChecker.check_url_for_app(app)
+        if not manager:
+            return
+
+        try:
+            appimage_provider.update_from_url(manager, app, status_cb=lambda s: None)
+        except Exception as e:
+            logging.error(e)
+            GLib.idle_add(show_message_dialog, str(e))
+
+        GLib.idle_add(self.refresh_list)
+
+    def on_grid_item_remove(self, card, app: AppImageListElement):
+        show_remove_confirm_dialog(self.on_grid_item_remove_confirm, app)
+
+    def on_grid_item_remove_confirm(self, dialog, response: str, app: AppImageListElement):
+        if response == 'remove':
+            appimage_provider.uninstall(app)
+            self.refresh_list()
